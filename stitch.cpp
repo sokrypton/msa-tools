@@ -13,8 +13,8 @@
 #include <omp.h>
 #endif
 
-// Compile with OpenMP: g++ -O3 -march=native -std=c++17 -fopenmp stitch_opt.cpp -o stitch_opt
-// Without OpenMP: g++ -O3 -march=native -std=c++17 stitch_opt.cpp -o stitch_opt
+// Compile with OpenMP: g++ -O3 -march=native -std=c++17 -fopenmp stitch.cpp -o stitch
+// Without OpenMP: g++ -O3 -march=native -std=c++17 stitch.cpp -o stitch
 
 struct Sequence {
     std::string header;
