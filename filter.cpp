@@ -5,8 +5,24 @@
 #include <chrono>
 #include <cstring>
 #include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
 
-// Compile: g++ -O3 -march=native -std=c++17 filter.cpp -o filter
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+// SIMD includes
+#if defined(__AVX2__)
+#include <immintrin.h>
+#define USE_AVX2
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#define USE_SSE2
+#endif
+
+// Compile with OpenMP and SIMD: g++ -O3 -march=native -std=c++17 -fopenmp filter.cpp -o filter
+// Without OpenMP: g++ -O3 -march=native -std=c++17 filter.cpp -o filter
 
 struct Sequence {
     std::string header;
@@ -69,27 +85,132 @@ void analyze_sequence(Sequence& seq) {
     }
 }
 
-// Fast pairwise identity calculation
-float calculate_pairwise_identity(const std::string& seq1, const std::string& seq2) {
+// Fast pairwise identity calculation with SIMD vectorization and early termination
+float calculate_pairwise_identity(const std::string& seq1, const std::string& seq2, float threshold = 0.0f) {
     if (seq1.length() != seq2.length()) return 0.0f;
+    
+    const size_t len = seq1.length();
+    const char* s1 = seq1.c_str();
+    const char* s2 = seq2.c_str();
     
     int matches = 0;
     int valid = 0;
     
-    for (size_t i = 0; i < seq1.length(); i++) {
-        if (seq1[i] != '-' && seq2[i] != '-') {
+#ifdef USE_AVX2
+    // AVX2 vectorized version - process 32 bytes at a time
+    const size_t simd_end = len - (len % 32);
+    
+    __m256i matches_vec = _mm256_setzero_si256();
+    __m256i valid_vec = _mm256_setzero_si256();
+    __m256i gap_char = _mm256_set1_epi8('-');
+    
+    for (size_t i = 0; i < simd_end; i += 32) {
+        // Load 32 characters from each sequence
+        __m256i v1 = _mm256_loadu_si256((__m256i*)(s1 + i));
+        __m256i v2 = _mm256_loadu_si256((__m256i*)(s2 + i));
+        
+        // Check for gaps
+        __m256i gap1 = _mm256_cmpeq_epi8(v1, gap_char);
+        __m256i gap2 = _mm256_cmpeq_epi8(v2, gap_char);
+        __m256i no_gaps = _mm256_andnot_si256(_mm256_or_si256(gap1, gap2), _mm256_set1_epi8(-1));
+        
+        // Check for matches
+        __m256i matches_mask = _mm256_and_si256(_mm256_cmpeq_epi8(v1, v2), no_gaps);
+        
+        // Count valid positions and matches
+        valid_vec = _mm256_sub_epi8(valid_vec, no_gaps);  // -1 for valid, 0 for invalid
+        matches_vec = _mm256_sub_epi8(matches_vec, matches_mask);  // -1 for match, 0 for no match
+    }
+    
+    // Horizontal sum of vectors
+    __m256i valid_sum = _mm256_sad_epu8(valid_vec, _mm256_setzero_si256());
+    __m256i matches_sum = _mm256_sad_epu8(matches_vec, _mm256_setzero_si256());
+    
+    // Extract results
+    valid += _mm256_extract_epi64(valid_sum, 0) + _mm256_extract_epi64(valid_sum, 1) + 
+             _mm256_extract_epi64(valid_sum, 2) + _mm256_extract_epi64(valid_sum, 3);
+    matches += _mm256_extract_epi64(matches_sum, 0) + _mm256_extract_epi64(matches_sum, 1) + 
+               _mm256_extract_epi64(matches_sum, 2) + _mm256_extract_epi64(matches_sum, 3);
+    
+    // Process remaining characters
+    for (size_t i = simd_end; i < len; i++) {
+        if (s1[i] != '-' && s2[i] != '-') {
             valid++;
-            if (seq1[i] == seq2[i]) {
+            if (s1[i] == s2[i]) {
                 matches++;
             }
         }
     }
     
+#elif defined(USE_SSE2)
+    // SSE2 vectorized version - process 16 bytes at a time
+    const size_t simd_end = len - (len % 16);
+    
+    __m128i matches_vec = _mm_setzero_si128();
+    __m128i valid_vec = _mm_setzero_si128();
+    __m128i gap_char = _mm_set1_epi8('-');
+    
+    for (size_t i = 0; i < simd_end; i += 16) {
+        // Load 16 characters from each sequence
+        __m128i v1 = _mm_loadu_si128((__m128i*)(s1 + i));
+        __m128i v2 = _mm_loadu_si128((__m128i*)(s2 + i));
+        
+        // Check for gaps
+        __m128i gap1 = _mm_cmpeq_epi8(v1, gap_char);
+        __m128i gap2 = _mm_cmpeq_epi8(v2, gap_char);
+        __m128i no_gaps = _mm_andnot_si128(_mm_or_si128(gap1, gap2), _mm_set1_epi8(-1));
+        
+        // Check for matches
+        __m128i matches_mask = _mm_and_si128(_mm_cmpeq_epi8(v1, v2), no_gaps);
+        
+        // Count valid positions and matches
+        valid_vec = _mm_sub_epi8(valid_vec, no_gaps);
+        matches_vec = _mm_sub_epi8(matches_vec, matches_mask);
+    }
+    
+    // Horizontal sum
+    __m128i valid_sum = _mm_sad_epu8(valid_vec, _mm_setzero_si128());
+    __m128i matches_sum = _mm_sad_epu8(matches_vec, _mm_setzero_si128());
+    
+    valid += _mm_extract_epi16(valid_sum, 0) + _mm_extract_epi16(valid_sum, 4);
+    matches += _mm_extract_epi16(matches_sum, 0) + _mm_extract_epi16(matches_sum, 4);
+    
+    // Process remaining characters
+    for (size_t i = simd_end; i < len; i++) {
+        if (s1[i] != '-' && s2[i] != '-') {
+            valid++;
+            if (s1[i] == s2[i]) {
+                matches++;
+            }
+        }
+    }
+    
+#else
+    // Scalar fallback with early termination
+    for (size_t i = 0; i < len; i++) {
+        if (s1[i] != '-' && s2[i] != '-') {
+            valid++;
+            if (s1[i] == s2[i]) {
+                matches++;
+            }
+            
+            // Early termination check every 64 positions
+            if (threshold > 0.0f && i > 64 && (i % 64) == 0) {
+                float current_identity = (float)matches / valid;
+                float max_possible = (float)(matches + (len - i)) / (valid + (len - i));
+                if (max_possible < threshold) {
+                    return current_identity;
+                }
+            }
+        }
+    }
+#endif
+    
     return valid > 0 ? (float)matches / valid : 0.0f;
 }
 
-// Quick pre-filter for redundancy check
-bool should_skip_redundancy_check(const Sequence& s1, const Sequence& s2, float threshold) {
+// Traditional pre-filter (amino acid composition)
+bool should_skip_composition_check(const Sequence& s1, const Sequence& s2, float threshold) {
     // Length filter
     int diff = std::abs(s1.non_gap_count - s2.non_gap_count);
     if (diff > s1.non_gap_count * (1.0f - threshold)) {
@@ -110,7 +231,7 @@ bool should_skip_redundancy_check(const Sequence& s1, const Sequence& s2, float 
 }
 
 void print_usage(const char* program) {
-    std::cout << "Enhanced MSA Filter\n\n";
+    std::cout << "MSA Filter\n\n";
     std::cout << "Usage: " << program << " -i <input.a3m> -o <output.a3m> [options]\n";
     std::cout << "   or: " << program << " <input.a3m> <output.a3m> [options]\n\n";
     std::cout << "Required:\n";
@@ -124,8 +245,8 @@ void print_usage(const char* program) {
     std::cout << "Note: By default, NO filtering is applied.\n\n";
     std::cout << "Examples:\n";
     std::cout << "  " << program << " -i input.a3m -o output.a3m\n";
-    std::cout << "  " << program << " -i input.a3m -o output.a3m -cov 75\n";
-    std::cout << "  " << program << " input.a3m output.a3m -id 90 -cov 75 -qid 15\n";
+    std::cout << "  " << program << " -i input.a3m -o output.a3m -id 90\n";
+    std::cout << "  " << program << " input.a3m output.a3m -id 90\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -136,9 +257,9 @@ int main(int argc, char* argv[]) {
     
     std::string input_file;
     std::string output_file;
-    float max_pairwise_identity = 0.0f;  // Default: off
-    float min_query_identity = 0.0f;     // Default: off  
-    float min_coverage = 0.0f;           // Default: off
+    float max_pairwise_identity = 0.0f;
+    float min_query_identity = 0.0f;
+    float min_coverage = 0.0f;
     
     // Simple argument parsing
     int i = 1;
@@ -159,16 +280,14 @@ int main(int argc, char* argv[]) {
             print_usage(argv[0]);
             return 0;
         } else if (arg[0] != '-' && input_file.empty()) {
-            // Positional argument - input file
             input_file = arg;
         } else if (arg[0] != '-' && output_file.empty()) {
-            // Positional argument - output file
             output_file = arg;
         }
         i++;
     }
     
-    // Validate required arguments
+    // Validate arguments
     if (input_file.empty() || output_file.empty()) {
         std::cerr << "Error: Input and output files are required\n";
         print_usage(argv[0]);
@@ -179,6 +298,15 @@ int main(int argc, char* argv[]) {
     std::cout << "Filter Settings:\n";
     std::cout << "  Input: " << input_file << "\n";
     std::cout << "  Output: " << output_file << "\n";
+    
+    // Show SIMD capabilities
+    #ifdef USE_AVX2
+    std::cout << "  SIMD: AVX2 enabled (32-byte vectorization)\n";
+    #elif defined(USE_SSE2)
+    std::cout << "  SIMD: SSE2 enabled (16-byte vectorization)\n";
+    #else
+    std::cout << "  SIMD: Scalar fallback (no vectorization)\n";
+    #endif
     
     bool has_filters = false;
     if (max_pairwise_identity > 0.0f) {
@@ -254,12 +382,18 @@ int main(int argc, char* argv[]) {
     const size_t query_len = query.length();
     
     // Calculate metrics for all sequences
-    for (auto& seq : sequences) {
+    std::cout << "Calculating metrics...\n";
+    
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
+    for (size_t i = 0; i < sequences.size(); i++) {
+        auto& seq = sequences[i];
         calculate_metrics(seq, query);
         analyze_sequence(seq);
     }
     
-    // Apply filters
+    // Apply initial filters
     std::vector<Sequence> filtered_sequences;
     
     size_t length_filtered = 0;
@@ -271,7 +405,7 @@ int main(int argc, char* argv[]) {
         
         // Always keep query
         if (i == 0) {
-            filtered_sequences.push_back(seq);
+            filtered_sequences.push_back(std::move(sequences[i]));
             continue;
         }
         
@@ -293,7 +427,7 @@ int main(int argc, char* argv[]) {
             continue;
         }
         
-        filtered_sequences.push_back(seq);
+        filtered_sequences.push_back(std::move(sequences[i]));
     }
     
     std::cout << "After cov/qid filtering: " << filtered_sequences.size() << " sequences\n";
@@ -307,45 +441,84 @@ int main(int argc, char* argv[]) {
     if (max_pairwise_identity > 0.0f) {
         std::cout << "Applying redundancy filter...\n";
         
+        #ifdef _OPENMP
+        std::cout << "Using " << omp_get_max_threads() << " threads\n";
+        #endif
+        
         std::vector<bool> keep(filtered_sequences.size(), false);
         keep[0] = true;  // Always keep query
         
         std::vector<size_t> kept_indices = {0};
         size_t comparisons = 0;
-        size_t skipped = 0;
+        size_t skipped_composition = 0;
         
-        for (size_t i = 1; i < filtered_sequences.size(); i++) {
-            if (i % 1000 == 0) {
-                std::cout << "\rProcessing " << i << "/" << filtered_sequences.size() 
+        // Process sequences in chunks
+        const size_t chunk_size = 50;
+        
+        for (size_t start = 1; start < filtered_sequences.size(); start += chunk_size) {
+            size_t end = std::min(start + chunk_size, filtered_sequences.size());
+            
+            if (start % 1000 == 1) {
+                std::cout << "\rProcessing " << start << "/" << filtered_sequences.size() 
                          << " (kept: " << kept_indices.size() << ")";
                 std::cout.flush();
             }
             
-            bool should_keep = true;
+            // Thread-local counters
+            std::vector<size_t> local_comparisons(omp_get_max_threads(), 0);
+            std::vector<size_t> local_skipped_comp(omp_get_max_threads(), 0);
+            std::vector<bool> chunk_keep(end - start, false);
             
-            for (size_t kept_idx : kept_indices) {
-                if (should_skip_redundancy_check(filtered_sequences[i], filtered_sequences[kept_idx], max_pairwise_identity)) {
-                    skipped++;
-                    continue;
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(dynamic)
+            #endif
+            for (size_t idx = 0; idx < end - start; idx++) {
+                size_t i = start + idx;
+                bool should_keep = true;
+                
+                #ifdef _OPENMP
+                int thread_id = omp_get_thread_num();
+                #else
+                int thread_id = 0;
+                #endif
+                
+                // Check against all currently kept sequences
+                for (size_t kept_idx : kept_indices) {
+                    // Traditional composition pre-filter
+                    if (should_skip_composition_check(filtered_sequences[i], filtered_sequences[kept_idx], max_pairwise_identity)) {
+                        local_skipped_comp[thread_id]++;
+                        continue;
+                    }
+                    
+                    local_comparisons[thread_id]++;
+                    
+                    float pairwise_identity = calculate_pairwise_identity(
+                        filtered_sequences[i].cleaned_seq,
+                        filtered_sequences[kept_idx].cleaned_seq,
+                        max_pairwise_identity  // For early termination
+                    );
+                    
+                    if (pairwise_identity > max_pairwise_identity) {
+                        should_keep = false;
+                        break;
+                    }
                 }
                 
-                comparisons++;
-                
-                float pairwise_identity = calculate_pairwise_identity(
-                    filtered_sequences[i].cleaned_seq,
-                    filtered_sequences[kept_idx].cleaned_seq
-                );
-                
-                if (pairwise_identity > max_pairwise_identity) {
-                    should_keep = false;
-                    break;
+                chunk_keep[idx] = should_keep;
+            }
+            
+            // Update global state (serial section)
+            for (size_t idx = 0; idx < end - start; idx++) {
+                if (chunk_keep[idx]) {
+                    size_t i = start + idx;
+                    keep[i] = true;
+                    kept_indices.push_back(i);
                 }
             }
             
-            if (should_keep) {
-                keep[i] = true;
-                kept_indices.push_back(i);
-            }
+            // Accumulate thread-local counters
+            for (size_t tc : local_comparisons) comparisons += tc;
+            for (size_t ts : local_skipped_comp) skipped_composition += ts;
         }
         
         std::cout << "\n";
@@ -357,8 +530,9 @@ int main(int argc, char* argv[]) {
         }
         
         std::cout << "Redundancy filter stats:\n";
-        std::cout << "  Comparisons: " << comparisons << "\n";
-        std::cout << "  Skipped: " << skipped << "\n";
+        std::cout << "  Full pairwise comparisons: " << comparisons << "\n";
+        std::cout << "  Skipped (composition): " << skipped_composition << "\n";
+        std::cout << "  Skip rate: " << (100.0 * skipped_composition / (comparisons + skipped_composition)) << "%\n";
     } else {
         final_sequences = std::move(filtered_sequences);
     }
